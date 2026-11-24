@@ -1,6 +1,7 @@
 import os
 import io
 import csv
+import zipfile
 import tempfile
 from datetime import datetime
 import cv2
@@ -50,13 +51,6 @@ st.markdown(
         opacity: 0.82;
         font-size: 0.95rem;
     }
-    .result-card {
-        padding: 1.25rem 1.4rem;
-        border-radius: 12px;
-        background-color: rgba(128, 128, 128, 0.06);
-        border: 1px solid rgba(128, 128, 128, 0.18);
-        margin-bottom: 1rem;
-    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -99,6 +93,8 @@ CLASS_NOTES = {
     "notumor": "No abnormal intracranial mass or focal neoplastic lesion detected in this slice.",
     "pituitary": "Sellar/parasellar lesion originating from the pituitary gland at the skull base.",
 }
+
+VALID_IMG_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff")
 
 if "scan_history" not in st.session_state:
     st.session_state.scan_history = []
@@ -166,6 +162,14 @@ def run_inference(model, input_tensor):
     return single_probs, tta_probs
 
 
+def classify_triage(confidence, margin):
+    if confidence >= 80.0 and margin >= 25.0:
+        return "High Confidence Match"
+    if confidence >= 60.0 and margin >= 10.0:
+        return "Moderate Confidence - Clinical Correlation Advised"
+    return "Low Confidence - Specialist Review Required"
+
+
 def enhance_scan(pil_img, brightness=1.0, contrast=1.0, sharpness=1.0):
     img = ImageEnhance.Brightness(pil_img).enhance(brightness)
     img = ImageEnhance.Contrast(img).enhance(contrast)
@@ -188,6 +192,32 @@ def create_demo_scan(size=260):
     draw.ellipse([65, 55, size - 65, size - 55], fill=(110, 115, 125))
     draw.ellipse([int(size * 0.56), int(size * 0.34), int(size * 0.74), int(size * 0.52)], fill=(215, 220, 230))
     return img.filter(ImageFilter.GaussianBlur(radius=1.5))
+
+
+def extract_uploaded_batch(uploaded_files):
+    """Extracts (filename, PIL.Image) pairs from uploaded image files and/or ZIP archives."""
+    items = []
+    for f in uploaded_files:
+        fname_lower = f.name.lower()
+        if fname_lower.endswith(".zip"):
+            with zipfile.ZipFile(io.BytesIO(f.read())) as zf:
+                for member in sorted(zf.namelist()):
+                    if member.endswith("/") or "__MACOSX" in member:
+                        continue
+                    if member.lower().endswith(VALID_IMG_EXTS):
+                        try:
+                            raw = zf.read(member)
+                            img = Image.open(io.BytesIO(raw)).convert("RGB")
+                            items.append((os.path.basename(member), img))
+                        except Exception:
+                            continue
+        elif fname_lower.endswith(VALID_IMG_EXTS):
+            try:
+                img = Image.open(f).convert("RGB")
+                items.append((f.name, img))
+            except Exception:
+                continue
+    return items
 
 
 # ======================================
@@ -284,7 +314,7 @@ def generate_pdf_report(
     return bytes(pdf.output())
 
 
-def history_to_csv(records):
+def records_to_csv(records):
     if not records:
         return b""
     output = io.StringIO()
@@ -295,7 +325,7 @@ def history_to_csv(records):
 
 
 # ======================================
-# CLEAN SIDEBAR (PRIMARY NAVIGATION + COLLAPSED EXTRAS)
+# CLEAN SIDEBAR
 # ======================================
 available_specialties = {k: v for k, v in SPECIALTIES.items() if os.path.exists(v["file"])}
 if not available_specialties:
@@ -343,209 +373,380 @@ with st.sidebar:
     st.caption("⚠️ Educational & research decision-support tool only. Not a clinical diagnosis.")
 
 # ======================================
-# SPACIOUS HEADER & UPLOAD BAR
+# HEADER & WORKFLOW MODE SWITCHER
 # ======================================
 st.markdown(
     f"""
     <div class="header-box">
         <h1>🏥 MedVision — {selected_specialty}</h1>
-        <p>Upload a {spec_info['modality'].lower()} for automated classification, Grad-CAM++ localization, and PDF reporting.</p>
+        <p>Analyze single scans in depth or bulk-process entire image folders and ZIP archives with CSV & heatmap exports.</p>
     </div>
     """,
     unsafe_allow_html=True,
 )
 
-up_col, demo_col = st.columns([4, 1], vertical_alignment="bottom")
-with up_col:
-    uploaded_file = st.file_uploader(
-        f"Upload {spec_info['modality']} (JPG, PNG, BMP, WEBP)",
-        type=["jpg", "jpeg", "png", "bmp", "webp"],
-    )
-with demo_col:
-    use_demo = st.button("🧪 Try Demo Scan", use_container_width=True)
+workflow_mode = st.segmented_control(
+    "Workflow Mode",
+    ["🔬 Single Scan Workstation", "📦 Bulk Batch Processor"],
+    default="🔬 Single Scan Workstation",
+    label_visibility="collapsed",
+)
 
-if uploaded_file is not None:
-    st.session_state["active_image"] = Image.open(uploaded_file).convert("RGB")
-    st.session_state["active_name"] = uploaded_file.name
-elif use_demo:
-    st.session_state["active_image"] = create_demo_scan(IMG_SIZE)
-    st.session_state["active_name"] = "demo_phantom_scan.png"
+transform = transforms.Compose([
+    transforms.Resize((IMG_SIZE, IMG_SIZE)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
 
-# ======================================
-# PRIMARY 2-COLUMN DIAGNOSTIC WORKSPACE
-# ======================================
-if "active_image" in st.session_state:
-    raw_rgb = st.session_state["active_image"]
-    scan_name = st.session_state.get("active_name", "uploaded_scan.png")
-    orig_w, orig_h = raw_rgb.size
-
-    enhanced_pil = enhance_scan(raw_rgb, brightness=brightness, contrast=contrast, sharpness=sharpness)
-    resized_pil = enhanced_pil.resize((IMG_SIZE, IMG_SIZE))
-    rgb_uint8 = np.array(resized_pil, dtype=np.uint8)
-    rgb_float = rgb_uint8.astype(np.float32) / 255.0
-
-    transform = transforms.Compose([
-        transforms.Resize((IMG_SIZE, IMG_SIZE)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
-    ])
-    input_tensor = transform(enhanced_pil).unsqueeze(0).to(device)
-
-    with st.spinner("Analyzing scan..."):
-        single_probs, tta_probs = run_inference(model, input_tensor)
-        probs = tta_probs if use_tta else single_probs
-
-        sorted_indices = np.argsort(probs)[::-1]
-        top1_idx = int(sorted_indices[0])
-        pred_class = CLASSES[top1_idx]
-        confidence = float(probs[top1_idx] * 100)
-        margin = (
-            float((probs[sorted_indices[0]] - probs[sorted_indices[1]]) * 100)
-            if len(CLASSES) > 1
-            else 100.0
+# ======================================================================
+# MODE 1: SINGLE SCAN WORKSTATION
+# ======================================================================
+if workflow_mode == "🔬 Single Scan Workstation":
+    up_col, demo_col = st.columns([4, 1], vertical_alignment="bottom")
+    with up_col:
+        uploaded_file = st.file_uploader(
+            f"Upload {spec_info['modality']} (JPG, PNG, BMP, WEBP)",
+            type=["jpg", "jpeg", "png", "bmp", "webp"],
         )
+    with demo_col:
+        use_demo = st.button("🧪 Try Demo Scan", use_container_width=True)
 
-        with GradCAMPlusPlus(model=model, target_layers=target_layers) as cam:
-            grayscale_cam = cam(input_tensor=input_tensor, targets=None, eigen_smooth=True)[0]
+    if uploaded_file is not None:
+        st.session_state["active_image"] = Image.open(uploaded_file).convert("RGB")
+        st.session_state["active_name"] = uploaded_file.name
+    elif use_demo:
+        st.session_state["active_image"] = create_demo_scan(IMG_SIZE)
+        st.session_state["active_name"] = "demo_phantom_scan.png"
 
-        cam_overlay = show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True, image_weight=1.0 - cam_alpha)
-        contour_img, num_hotspots = draw_attention_contours(rgb_uint8, grayscale_cam, threshold=contour_thresh)
+    if "active_image" in st.session_state:
+        raw_rgb = st.session_state["active_image"]
+        scan_name = st.session_state.get("active_name", "uploaded_scan.png")
+        orig_w, orig_h = raw_rgb.size
 
-    st.write("")
+        enhanced_pil = enhance_scan(raw_rgb, brightness=brightness, contrast=contrast, sharpness=sharpness)
+        resized_pil = enhanced_pil.resize((IMG_SIZE, IMG_SIZE))
+        rgb_uint8 = np.array(resized_pil, dtype=np.uint8)
+        rgb_float = rgb_uint8.astype(np.float32) / 255.0
 
-    left_col, right_col = st.columns([1.15, 1], gap="large")
+        input_tensor = transform(enhanced_pil).unsqueeze(0).to(device)
 
-    with left_col:
-        view_choice = st.segmented_control(
-            "Display Mode",
-            ["Side-by-Side", "Grad-CAM++ Heatmap", "Hotspot Contours", "Original Scan"],
-            default="Side-by-Side",
-            label_visibility="collapsed",
-        )
+        with st.spinner("Analyzing scan..."):
+            single_probs, tta_probs = run_inference(model, input_tensor)
+            probs = tta_probs if use_tta else single_probs
 
-        if view_choice == "Side-by-Side":
-            img_c1, img_c2 = st.columns(2, gap="medium")
-            with img_c1:
-                st.image(resized_pil, caption=f"Input ({orig_w}×{orig_h} px)", use_container_width=True)
-            with img_c2:
-                st.image(cam_overlay, caption="Grad-CAM++ Focus", use_container_width=True)
-        elif view_choice == "Grad-CAM++ Heatmap":
-            st.image(cam_overlay, caption="Grad-CAM++ Localization Overlay", use_container_width=True)
-        elif view_choice == "Hotspot Contours":
-            st.image(
-                contour_img,
-                caption=f"{num_hotspots} hotspot(s) detected above {contour_thresh * 100:.0f}% attention",
-                use_container_width=True,
+            sorted_indices = np.argsort(probs)[::-1]
+            top1_idx = int(sorted_indices[0])
+            pred_class = CLASSES[top1_idx]
+            confidence = float(probs[top1_idx] * 100)
+            margin = (
+                float((probs[sorted_indices[0]] - probs[sorted_indices[1]]) * 100)
+                if len(CLASSES) > 1
+                else 100.0
             )
-        else:
-            st.image(resized_pil, caption=f"Original Scan ({orig_w}×{orig_h} px)", use_container_width=True)
 
-    with right_col:
-        if confidence >= 80.0 and margin >= 25.0:
-            triage_label = "High Confidence Match"
-            st.success(f"**{triage_label}** (+{margin:.1f}% margin)")
-        elif confidence >= 60.0 and margin >= 10.0:
-            triage_label = "Moderate Confidence — Clinical Correlation Advised"
-            st.info(f"**{triage_label}** (+{margin:.1f}% margin)")
-        else:
-            triage_label = "Low Confidence — Specialist Review Required"
-            st.warning(f"**{triage_label}**")
+            with GradCAMPlusPlus(model=model, target_layers=target_layers) as cam:
+                grayscale_cam = cam(input_tensor=input_tensor, targets=None, eigen_smooth=True)[0]
 
-        m1, m2 = st.columns(2)
-        m1.metric("Predicted Condition", pred_class.upper())
-        m2.metric("Confidence", f"{confidence:.2f}%")
-
-        if pred_class.lower() in CLASS_NOTES:
-            st.caption(CLASS_NOTES[pred_class.lower()])
+            cam_overlay = show_cam_on_image(rgb_float, grayscale_cam, use_rgb=True, image_weight=1.0 - cam_alpha)
+            contour_img, num_hotspots = draw_attention_contours(rgb_uint8, grayscale_cam, threshold=contour_thresh)
 
         st.write("")
-        st.markdown("**Probability Breakdown**")
-        for idx in sorted_indices:
-            cls = CLASSES[int(idx)]
-            prob = float(probs[int(idx)])
-            st.progress(prob, text=f"{cls}: {prob * 100:.2f}%")
+        left_col, right_col = st.columns([1.15, 1], gap="large")
 
-        st.write("")
-        btn_c1, btn_c2 = st.columns(2)
-        with btn_c1:
-            pdf_bytes = generate_pdf_report(
-                resized_pil,
-                cam_overlay,
-                selected_specialty,
-                scan_name,
-                pred_class,
-                confidence,
-                triage_label,
-                CLASSES,
-                probs,
-                arch,
-                use_tta,
+        with left_col:
+            view_choice = st.segmented_control(
+                "Display Mode",
+                ["Side-by-Side", "Grad-CAM++ Heatmap", "Hotspot Contours", "Original Scan"],
+                default="Side-by-Side",
+                label_visibility="collapsed",
             )
-            st.download_button(
-                label="📄 Download PDF Report",
-                data=pdf_bytes,
-                file_name=f"MedVision_{pred_class}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                mime="application/pdf",
-                use_container_width=True,
-                type="primary",
-            )
-        with btn_c2:
-            if st.button("➕ Save to Session Log", use_container_width=True):
-                st.session_state.scan_history.append({
-                    "Time": datetime.now().strftime("%H:%M:%S"),
-                    "File": scan_name,
-                    "Specialty": _pdf_safe(selected_specialty),
-                    "Prediction": pred_class,
-                    "Confidence (%)": round(confidence, 2),
-                    "Triage": _pdf_safe(triage_label),
-                })
-                st.toast("Saved to session log!")
 
-    st.write("")
-    st.divider()
-
-    # ======================================
-    # OPTIONAL DETAILS IN CLEAN EXPANDERS
-    # ======================================
-    with st.expander("📊 View Single-View vs. 4-View TTA Confidence Chart", expanded=False):
-        fig, ax = plt.subplots(figsize=(7, max(2.8, len(CLASSES) * 0.48)))
-        y_pos = np.arange(len(CLASSES))
-        ordered_classes = [CLASSES[int(i)] for i in sorted_indices][::-1]
-        ordered_single = [single_probs[int(i)] * 100 for i in sorted_indices][::-1]
-        ordered_tta = [tta_probs[int(i)] * 100 for i in sorted_indices][::-1]
-
-        ax.barh(y_pos - 0.18, ordered_single, height=0.35, label="Single-View", color="#94a3b8")
-        ax.barh(y_pos + 0.18, ordered_tta, height=0.35, label="4-View TTA", color="#0284c7")
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(ordered_classes)
-        ax.set_xlim(0, 105)
-        ax.set_xlabel("Confidence (%)")
-        ax.legend(loc="lower right")
-        ax.grid(axis="x", linestyle="--", alpha=0.35)
-        plt.tight_layout()
-        st.pyplot(fig)
-        plt.close(fig)
-
-    with st.expander(f"📋 Session Diagnostic Log ({len(st.session_state.scan_history)} saved)", expanded=False):
-        if st.session_state.scan_history:
-            st.dataframe(st.session_state.scan_history, use_container_width=True)
-            l1, l2 = st.columns([1, 1])
-            with l1:
-                st.download_button(
-                    label="Download CSV Log",
-                    data=history_to_csv(st.session_state.scan_history),
-                    file_name=f"MedVision_Log_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime="text/csv",
+            if view_choice == "Side-by-Side":
+                img_c1, img_c2 = st.columns(2, gap="medium")
+                with img_c1:
+                    st.image(resized_pil, caption=f"Input ({orig_w}×{orig_h} px)", use_container_width=True)
+                with img_c2:
+                    st.image(cam_overlay, caption="Grad-CAM++ Focus", use_container_width=True)
+            elif view_choice == "Grad-CAM++ Heatmap":
+                st.image(cam_overlay, caption="Grad-CAM++ Localization Overlay", use_container_width=True)
+            elif view_choice == "Hotspot Contours":
+                st.image(
+                    contour_img,
+                    caption=f"{num_hotspots} hotspot(s) detected above {contour_thresh * 100:.0f}% attention",
                     use_container_width=True,
                 )
-            with l2:
-                if st.button("Clear Log", use_container_width=True):
-                    st.session_state.scan_history = []
-                    st.rerun()
-        else:
-            st.caption("No scans saved yet. Click **Save to Session Log** after analyzing a scan.")
+            else:
+                st.image(resized_pil, caption=f"Original Scan ({orig_w}×{orig_h} px)", use_container_width=True)
 
+        with right_col:
+            triage_label = classify_triage(confidence, margin)
+            if triage_label.startswith("High"):
+                st.success(f"**{triage_label}** (+{margin:.1f}% margin)")
+            elif triage_label.startswith("Moderate"):
+                st.info(f"**{triage_label}** (+{margin:.1f}% margin)")
+            else:
+                st.warning(f"**{triage_label}**")
+
+            m1, m2 = st.columns(2)
+            m1.metric("Predicted Condition", pred_class.upper())
+            m2.metric("Confidence", f"{confidence:.2f}%")
+
+            if pred_class.lower() in CLASS_NOTES:
+                st.caption(CLASS_NOTES[pred_class.lower()])
+
+            st.write("")
+            st.markdown("**Probability Breakdown**")
+            for idx in sorted_indices:
+                cls = CLASSES[int(idx)]
+                prob = float(probs[int(idx)])
+                st.progress(prob, text=f"{cls}: {prob * 100:.2f}%")
+
+            st.write("")
+            btn_c1, btn_c2 = st.columns(2)
+            with btn_c1:
+                pdf_bytes = generate_pdf_report(
+                    resized_pil,
+                    cam_overlay,
+                    selected_specialty,
+                    scan_name,
+                    pred_class,
+                    confidence,
+                    triage_label,
+                    CLASSES,
+                    probs,
+                    arch,
+                    use_tta,
+                )
+                st.download_button(
+                    label="📄 Download PDF Report",
+                    data=pdf_bytes,
+                    file_name=f"MedVision_{pred_class}_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    type="primary",
+                )
+            with btn_c2:
+                if st.button("➕ Save to Session Log", use_container_width=True):
+                    st.session_state.scan_history.append({
+                        "Time": datetime.now().strftime("%H:%M:%S"),
+                        "File": scan_name,
+                        "Specialty": _pdf_safe(selected_specialty),
+                        "Prediction": pred_class,
+                        "Confidence (%)": round(confidence, 2),
+                        "Triage": _pdf_safe(triage_label),
+                    })
+                    st.toast("Saved to session log!")
+
+        st.write("")
+        st.divider()
+
+        with st.expander("📊 View Single-View vs. 4-View TTA Confidence Chart", expanded=False):
+            fig, ax = plt.subplots(figsize=(7, max(2.8, len(CLASSES) * 0.48)))
+            y_pos = np.arange(len(CLASSES))
+            ordered_classes = [CLASSES[int(i)] for i in sorted_indices][::-1]
+            ordered_single = [single_probs[int(i)] * 100 for i in sorted_indices][::-1]
+            ordered_tta = [tta_probs[int(i)] * 100 for i in sorted_indices][::-1]
+
+            ax.barh(y_pos - 0.18, ordered_single, height=0.35, label="Single-View", color="#94a3b8")
+            ax.barh(y_pos + 0.18, ordered_tta, height=0.35, label="4-View TTA", color="#0284c7")
+            ax.set_yticks(y_pos)
+            ax.set_yticklabels(ordered_classes)
+            ax.set_xlim(0, 105)
+            ax.set_xlabel("Confidence (%)")
+            ax.legend(loc="lower right")
+            ax.grid(axis="x", linestyle="--", alpha=0.35)
+            plt.tight_layout()
+            st.pyplot(fig)
+            plt.close(fig)
+
+        with st.expander(f"📋 Session Diagnostic Log ({len(st.session_state.scan_history)} saved)", expanded=False):
+            if st.session_state.scan_history:
+                st.dataframe(st.session_state.scan_history, use_container_width=True)
+                l1, l2 = st.columns([1, 1])
+                with l1:
+                    st.download_button(
+                        label="Download CSV Log",
+                        data=records_to_csv(st.session_state.scan_history),
+                        file_name=f"MedVision_Log_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                    )
+                with l2:
+                    if st.button("Clear Log", use_container_width=True):
+                        st.session_state.scan_history = []
+                        st.rerun()
+            else:
+                st.caption("No scans saved yet. Click **Save to Session Log** after analyzing a scan.")
+
+    else:
+        st.info(
+            f"Upload a **{spec_info['modality']}** above or click **🧪 Try Demo Scan** to begin analysis."
+        )
+
+# ======================================================================
+# MODE 2: BULK BATCH PROCESSOR
+# ======================================================================
 else:
-    st.info(
-        f"Upload a **{spec_info['modality']}** above or click **🧪 Try Demo Scan** to begin analysis."
+    st.write("")
+    batch_files = st.file_uploader(
+        f"Select multiple {spec_info['modality']} images or upload a `.zip` folder",
+        type=["jpg", "jpeg", "png", "bmp", "webp", "zip"],
+        accept_multiple_files=True,
     )
+
+    opt_c1, opt_c2 = st.columns([1.2, 1], vertical_alignment="center")
+    with opt_c1:
+        include_heatmaps = st.checkbox(
+            "Generate Grad-CAM++ overlays for every scan (enables ZIP heatmap export & visual gallery)",
+            value=True,
+        )
+    with opt_c2:
+        run_batch_btn = st.button(
+            "🚀 Run Bulk Diagnosis",
+            type="primary",
+            disabled=not batch_files,
+            use_container_width=True,
+        )
+
+    if run_batch_btn and batch_files:
+        scan_items = extract_uploaded_batch(batch_files)
+        if not scan_items:
+            st.error("No valid image files were found in the uploaded selection.")
+        else:
+            batch_records = []
+            heatmap_gallery = []
+            zip_buffer = io.BytesIO()
+
+            progress_bar = st.progress(0, text=f"Processing 0 / {len(scan_items)} scans...")
+            cam_ctx = GradCAMPlusPlus(model=model, target_layers=target_layers) if include_heatmaps else None
+
+            try:
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for idx, (fname, raw_pil) in enumerate(scan_items):
+                        enhanced_pil = enhance_scan(raw_pil, brightness=brightness, contrast=contrast, sharpness=sharpness)
+                        resized_pil = enhanced_pil.resize((IMG_SIZE, IMG_SIZE))
+                        input_tensor = transform(enhanced_pil).unsqueeze(0).to(device)
+
+                        single_probs, tta_probs = run_inference(model, input_tensor)
+                        probs = tta_probs if use_tta else single_probs
+
+                        sorted_idx = np.argsort(probs)[::-1]
+                        top1 = int(sorted_idx[0])
+                        pred_cls = CLASSES[top1]
+                        conf = float(probs[top1] * 100)
+                        margin = (
+                            float((probs[sorted_idx[0]] - probs[sorted_idx[1]]) * 100)
+                            if len(CLASSES) > 1
+                            else 100.0
+                        )
+                        triage = classify_triage(conf, margin)
+
+                        row = {
+                            "Filename": fname,
+                            "Prediction": pred_cls,
+                            "Confidence (%)": round(conf, 2),
+                            "Margin (%)": round(margin, 2),
+                            "Triage": triage,
+                        }
+                        for c_i, c_name in enumerate(CLASSES):
+                            row[f"Prob_{c_name} (%)"] = round(float(probs[c_i] * 100), 2)
+                        batch_records.append(row)
+
+                        if include_heatmaps and cam_ctx is not None:
+                            rgb_float = np.array(resized_pil, dtype=np.float32) / 255.0
+                            g_cam = cam_ctx(input_tensor=input_tensor, targets=None, eigen_smooth=True)[0]
+                            overlay = show_cam_on_image(rgb_float, g_cam, use_rgb=True, image_weight=1.0 - cam_alpha)
+
+                            img_buf = io.BytesIO()
+                            Image.fromarray(overlay).save(img_buf, format="PNG")
+                            clean_stem = os.path.splitext(fname)[0]
+                            zf.writestr(f"{pred_cls}/{clean_stem}_gradcam.png", img_buf.getvalue())
+
+                            if len(heatmap_gallery) < 24:
+                                heatmap_gallery.append((fname, pred_cls, conf, resized_pil, overlay))
+
+                        progress_bar.progress(
+                            (idx + 1) / len(scan_items),
+                            text=f"Processed {idx + 1} / {len(scan_items)}: {fname}",
+                        )
+            finally:
+                if cam_ctx is not None:
+                    cam_ctx.__exit__(None, None, None)
+
+            st.session_state["batch_results"] = batch_records
+            st.session_state["batch_gallery"] = heatmap_gallery
+            st.session_state["batch_zip"] = zip_buffer.getvalue() if include_heatmaps else None
+            st.success(f"Completed batch analysis of **{len(batch_records)}** scans!")
+
+    if "batch_results" in st.session_state and st.session_state["batch_results"]:
+        records = st.session_state["batch_results"]
+        total_scans = len(records)
+        high_conf_count = sum(1 for r in records if r["Triage"].startswith("High"))
+        review_count = sum(1 for r in records if r["Triage"].startswith("Low"))
+        avg_conf = sum(r["Confidence (%)"] for r in records) / total_scans
+
+        st.write("")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Total Scans Processed", total_scans)
+        s2.metric("Average Confidence", f"{avg_conf:.1f}%")
+        s3.metric("High Confidence", high_conf_count)
+        s4.metric("Needs Review", review_count)
+
+        st.write("")
+        f_col1, f_col2 = st.columns(2)
+        with f_col1:
+            pred_filter = st.multiselect(
+                "Filter by Predicted Class",
+                options=CLASSES,
+                default=CLASSES,
+            )
+        with f_col2:
+            triage_options = [
+                "High Confidence Match",
+                "Moderate Confidence - Clinical Correlation Advised",
+                "Low Confidence - Specialist Review Required",
+            ]
+            triage_filter = st.multiselect(
+                "Filter by Triage Level",
+                options=triage_options,
+                default=triage_options,
+            )
+
+        filtered_records = [
+            r for r in records
+            if r["Prediction"] in pred_filter and r["Triage"] in triage_filter
+        ]
+
+        st.dataframe(filtered_records, use_container_width=True)
+
+        dl_c1, dl_c2 = st.columns(2)
+        with dl_c1:
+            st.download_button(
+                label="📊 Download Full Batch Results (CSV)",
+                data=records_to_csv(records),
+                file_name=f"MedVision_Batch_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv",
+                type="primary",
+                use_container_width=True,
+            )
+        with dl_c2:
+            if st.session_state.get("batch_zip"):
+                st.download_button(
+                    label="🗂️ Download Grad-CAM++ Overlays (ZIP)",
+                    data=st.session_state["batch_zip"],
+                    file_name=f"MedVision_Heatmaps_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                    mime="application/zip",
+                    use_container_width=True,
+                )
+
+        if st.session_state.get("batch_gallery"):
+            with st.expander(f"🖼️ Visual Preview Gallery (First {len(st.session_state['batch_gallery'])} scans)", expanded=False):
+                gallery = st.session_state["batch_gallery"]
+                cols = st.columns(3, gap="medium")
+                for i, (g_name, g_cls, g_conf, g_orig, g_cam) in enumerate(gallery):
+                    with cols[i % 3]:
+                        st.image(
+                            g_cam,
+                            caption=f"{g_name} → {g_cls.upper()} ({g_conf:.1f}%)",
+                            use_container_width=True,
+                        )
