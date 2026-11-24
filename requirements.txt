@@ -1,13 +1,10 @@
-@"
---extra-index-url https://download.pytorch.org/whl/cpu
+﻿--extra-index-url https://download.pytorch.org/whl/cpu
 torch
 torchvision
 streamlit
 grad-cam
 pillow
 numpy
-scikit-learn
 matplotlib
 opencv-python-headless
 fpdf2
-"@ | Out-File -FilePath requirements.txt -Encoding utf8
